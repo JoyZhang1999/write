@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Air Canvas - Silk Smooth (镜像书写)</title>
+    <style>
+        body { 
+            margin: 0; padding: 0; overflow: hidden; 
+            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); 
+            font-family: 'Segoe UI', sans-serif; 
+        }
+        canvas { display: block; position: absolute; top: 0; left: 0; }
+        #video-container { display: none; }
+        
+        .loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #00d2ff; font-size: 20px; letter-spacing: 2px; pointer-events: none;
+            text-shadow: 0 0 15px rgba(0, 210, 255, 0.8);
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse { 0% { opacity: 0.5; } 50% { opacity: 1; } 100% { opacity: 0.5; } }
+
+        /* UI Panel */
+        .hud {
+            position: absolute; bottom: 30px; left: 30px;
+            color: rgba(255,255,255,0.9); pointer-events: none;
+            background: rgba(255, 255, 255, 0.1); 
+            backdrop-filter: blur(15px); -webkit-backdrop-filter: blur(15px);
+            padding: 20px; border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+        .hud p { margin: 8px 0; font-size: 14px; display: flex; align-items: center; }
+        .hud span { font-size: 20px; margin-right: 12px; width: 24px; text-align: center;}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div class="loading" id="loader">⚡ 系统正在预热...</div>
+    <div class="hud">
+        <p><span>🖐️</span> 张开手掌: <b>菜单 / 暂停</b></p>
+        <p><span>👌</span> 捏合食指: <b>丝滑书写</b></p>
+        <p><span>✌️</span> 剪刀手: <b>粒子消散</b></p>
+        <p><span>↔️</span> 双指: <b>缩放画布</b></p>
+    </div>
+
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+<script>
+const canvas = document.getElementById('output_canvas');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('input_video');
+
+// --- 核心变量 ---
+let strokes = []; // { points: [{x,y}], color, baseSize, tool }
+let currentStroke = null;
+let particles = [];
+let uiMode = false;
+let lastPalmTime = 0;
+let canvasScale = 1.0;
+let canvasOffset = { x: 0, y: 0 };
+let lastZoomDist = null;
+
+// 平滑光标变量
+let cursor = { x: 0, y: 0 }; 
+
+const settings = {
+    color: '#00d2ff', 
+    size: 6, // 基础粗细
+    tool: 'pen',
+    colors: ['#ff4757', '#00d2ff', '#2ed573', '#ffa502', '#ffffff'],
+    sizes: [4, 8, 12, 20]
+};
+
+let uiButtons = [];
+let uiPanelRect = { x:0, y:0, w:0, h:0 };
+
+// --- 初始化与UI ---
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    initUI();
+}
+window.addEventListener('resize', resize);
+
+function initUI() {
+    uiButtons = [];
+    const itemSize = 60; const gap = 20; const padding = 30;
+    const totalW = itemSize * 5 + gap * 4 + padding * 2;
+    const totalH = itemSize * 3 + gap * 2 + padding * 2;
+    const startX = (canvas.width - totalW)/2 + padding;
+    const startY = (canvas.height - totalH)/2 + padding;
+    uiPanelRect = { x: (canvas.width - totalW)/2, y: (canvas.height - totalH)/2, w: totalW, h: totalH };
+
+    settings.colors.forEach((c, i) => uiButtons.push({ type: 'color', val: c, x: startX + i*(itemSize+gap), y: startY, r: itemSize/2 }));
+    settings.sizes.forEach((s, i) => uiButtons.push({ type: 'size', val: s, x: startX + i*(itemSize+gap), y: startY + itemSize + gap, r: itemSize/2 }));
+    const tW = itemSize*2+gap;
+    uiButtons.push({ type: 'tool', val: 'pen', x: startX, y: startY + (itemSize+gap)*2, w: tW, h: itemSize, label: '🖊️' });
+    uiButtons.push({ type: 'tool', val: 'eraser', x: startX + tW + gap, y: startY + (itemSize+gap)*2, w: tW, h: itemSize, label: '🧽' });
+}
+resize();
+
+// --- 数学辅助 ---
+function dist(p1, p2) { return Math.hypot(p1.x - p2.x, p1.y - p2.y); }
+function lerp(start, end, amt) { return (1 - amt) * start + amt * end; }
+
+// toMirrored: 用于计算笔迹的坐标。不进行 X 轴校正，以实现“镜像书写”（手右字左）。
+function toMirrored(lm) { 
+    return { 
+        x: lm.x * canvas.width, 
+        y: lm.y * canvas.height 
+    }; 
+}
+
+// toScreen: 用于计算光标和 UI 交互的坐标。进行 X 轴校正，使其跟随用户在镜像画面中的视觉位置。
+function toScreen(lm) {
+    const x_raw = lm.x * canvas.width;
+    const y_raw = lm.y * canvas.height;
+    return {
+        x: canvas.width - x_raw, // 关键：手动翻转 X 轴坐标
+        y: y_raw
+    };
+}
+
+
+// --- 核心：丝滑绘制算法 (Bezier Curves) ---
+function drawStroke(ctx, points, color, size, tool) {
+    if (points.length < 2) return;
+
+    ctx.beginPath();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    
+    // 橡皮擦逻辑
+    if (tool === 'eraser') {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.lineWidth = size * 3;
+        ctx.strokeStyle = 'rgba(0,0,0,1)'; 
+    } else {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = size;
+    }
+
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length - 1; i++) {
+        const p0 = points[i];
+        const p1 = points[i + 1];
+        const midX = (p0.x + p1.x) / 2;
+        const midY = (p0.y + p1.y) / 2;
+        ctx.quadraticCurveTo(p0.x, p0.y, midX, midY);
+    }
+
+    if (points.length > 2) {
+        let last = points[points.length-1];
+        ctx.lineTo(last.x, last.y);
+    } else {
+        ctx.lineTo(points[1].x, points[1].y);
+    }
+    
+    ctx.stroke();
+}
+
+// --- 粒子特效 ---
+function createParticles() {
+    strokes.forEach(s => {
+        for(let i=0; i<s.points.length; i+=2) {
+            let p = s.points[i];
+            let vx = p.x * canvasScale + canvasOffset.x;
+            let vy = p.y * canvasScale + canvasOffset.y;
+            if(Math.random()>0.5) {
+                particles.push({
+                    x: vx, y: vy, 
+                    vx: (Math.random()-0.5)*4, vy: Math.random()*2+2,
+                    c: s.color, s: Math.random()*4+1, l: 1.0
+                });
+            }
+        }
+    });
+    strokes = [];
+}
+function updateParticles(ctx) {
+    ctx.globalCompositeOperation = 'source-over';
+    for(let i=particles.length-1; i>=0; i--) {
+        let p = particles[i];
+        p.x += p.vx; p.y += p.vy; p.l -= 0.02;
+        if(p.l<=0) { particles.splice(i,1); continue; }
+        ctx.fillStyle = p.c; ctx.globalAlpha = p.l;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.s, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha = 1.0;
+}
+
+// --- UI 交互 ---
+let hoverStart = 0; let lastHover = null;
+function handleUI(tip) {
+    // 绘制磨砂背景
+    ctx.fillStyle = 'rgba(10,10,20,0.6)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    
+    // 绘制面板背景
+    ctx.save();
+    ctx.fillStyle = 'rgba(30,30,40,0.85)';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 30;
+    ctx.beginPath(); 
+    ctx.roundRect(uiPanelRect.x, uiPanelRect.y, uiPanelRect.w, uiPanelRect.h, 25);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.restore();
+
+    let hovering = null;
+    uiButtons.forEach(b => {
+        let hit = false;
+        if (b.r) hit = dist(tip, {x: b.x+b.r, y: b.y+b.r}) < b.r;
+        else hit = tip.x>b.x && tip.x<b.x+b.w && tip.y>b.y && tip.y<b.y+b.h;
+        if (hit) hovering = b;
+
+        let active = (b.type==='color'&&settings.color===b.val) || (b.type==='size'&&settings.size===b.val) || (b.type==='tool'&&settings.tool===b.val);
+        
+        ctx.save();
+        if (b.type === 'color') {
+            ctx.translate(b.x+b.r, b.y+b.r);
+            if(active) { ctx.beginPath(); ctx.arc(0,0,b.r+4,0,Math.PI*2); ctx.strokeStyle='white'; ctx.lineWidth=3; ctx.stroke(); }
+            ctx.beginPath(); ctx.arc(0,0,active?b.r:b.r-2,0,Math.PI*2); ctx.fillStyle=b.val; ctx.fill();
+        } else if (b.type === 'size') {
+            ctx.translate(b.x+b.r, b.y+b.r);
+            ctx.beginPath(); ctx.arc(0,0,b.r,0,Math.PI*2); ctx.fillStyle=active?'rgba(255,255,255,0.2)':'rgba(0,0,0,0.3)'; ctx.fill();
+            ctx.beginPath(); ctx.arc(0,0,b.val/2 + 2,0,Math.PI*2); ctx.fillStyle=active?'#fff':'#888'; ctx.fill();
+        } else { // tool
+            ctx.fillStyle = active ? settings.color : 'rgba(255,255,255,0.05)';
+            ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 15); ctx.fill();
+            ctx.fillStyle = active ? '#000' : '#fff';
+            ctx.font = '24px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+            ctx.fillText(b.label, b.x+b.w/2, b.y+b.h/2);
+        }
+        ctx.restore();
+    });
+
+    // 悬停动画
+    if (hovering) {
+        document.body.style.cursor = 'pointer';
+        if (lastHover === hovering) {
+            let prog = (Date.now() - hoverStart) / 800; // 0.8秒触发
+            ctx.beginPath(); ctx.arc(tip.x, tip.y, 20, -Math.PI/2, Math.PI*2*prog - Math.PI/2);
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.stroke();
+            if (prog >= 1) {
+                if(hovering.type==='color') settings.color=hovering.val;
+                if(hovering.type==='size') settings.size=hovering.val;
+                if(hovering.type==='tool') settings.tool=hovering.val;
+                hoverStart = Date.now();
+            }
+        } else { lastHover = hovering; hoverStart = Date.now(); }
+    } else { lastHover = null; document.body.style.cursor = 'default'; }
+
+    // 光标
+    ctx.beginPath(); ctx.arc(tip.x, tip.y, 8, 0, Math.PI*2);
+    ctx.fillStyle = settings.color; ctx.fill();
+    ctx.strokeStyle = 'white'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+// --- 主循环 ---
+function onResults(results) {
+    document.getElementById('loader').style.display = 'none';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 1. 镜像绘制层 (摄像头画面镜像)
+    ctx.save();
+    ctx.scale(-1, 1); ctx.translate(-canvas.width, 0);
+    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+    // 绘制笔迹
+    ctx.save();
+    ctx.translate(canvas.width/2, canvas.height/2);
+    ctx.scale(canvasScale, canvasScale);
+    ctx.translate(-canvas.width/2 + canvasOffset.x, -canvas.height/2 + canvasOffset.y);
+    
+    strokes.forEach(s => drawStroke(ctx, s.points, s.color, s.size, s.tool));
+    ctx.restore();
+    
+    updateParticles(ctx);
+    ctx.restore(); // 结束摄像头画面镜像
+
+    // 2. 逻辑处理 (使用校正后的坐标进行交互)
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const h1 = results.multiHandLandmarks[0];
+        const h2 = results.multiHandLandmarks.length > 1 ? results.multiHandLandmarks[1] : null;
+
+        // UI 切换 (张开手掌) 逻辑不变...
+        const isPalm = (lm) => dist(lm[8], lm[0]) > dist(lm[6], lm[0])*1.3 && dist(lm[4], lm[17]) > 0.1;
+        if (isPalm(h1) || (h2 && isPalm(h2))) {
+            if (Date.now() - lastPalmTime > 1000) { uiMode = !uiMode; lastPalmTime = Date.now(); }
+        }
+
+        // *** 修复后的光标计算：使用 toScreen 确保光标跟随镜像的双手 ***
+        const tip_corrected = toScreen(h1[8]);
+        const tip = tip_corrected; 
+        
+        // 光标平滑插值
+        cursor.x = lerp(cursor.x, tip.x, 0.4);
+        cursor.y = lerp(cursor.y, tip.y, 0.4);
+
+        if (uiMode) {
+            handleUI(cursor);
+        } else {
+            // 剪刀手清屏
+            const isPeace = (lm) => lm[8].y<lm[6].y && lm[12].y<lm[10].y && lm[16].y>lm[14].y && dist(lm[8],lm[12])>0.05;
+            if (isPeace(h1)) { if(strokes.length) createParticles(); }
+            
+            // 缩放
+            else if (h2 && h1[8].y<h1[6].y && h2[8].y<h2[6].y && h1[12].y>h1[10].y) {
+                
+                const tip2 = toScreen(h2[8]); // Hand 2 也使用校正后的坐标
+                
+                const d = dist(tip, tip2); 
+                const p1 = cursor; 
+                const p2 = tip2;
+                
+                // 绘制缩放辅助线
+                ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+                ctx.strokeStyle = '#00d2ff'; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]);
+                
+                if(lastZoomDist) {
+                    canvasScale += (d - lastZoomDist) * 3;
+                    canvasScale = Math.max(0.5, Math.min(canvasScale, 5.0));
+                }
+                lastZoomDist = d; currentStroke = null;
+            } 
+            
+            // 书写
+            else {
+                lastZoomDist = null;
+                const isPinch = dist(h1[8], h1[4]) < 0.05;
+                
+                // 绘制笔尖光标
+                ctx.beginPath(); ctx.arc(cursor.x, cursor.y, 5, 0, Math.PI*2);
+                ctx.fillStyle = settings.color; ctx.fill();
+                
+                if (isPinch) {
+                    // *** 关键：笔迹坐标使用 toMirrored，实现镜像书写效果 ***
+                    const raw_tip = toMirrored(h1[8]); 
+                    const vx = (raw_tip.x - canvas.width/2)/canvasScale + canvas.width/2 - canvasOffset.x;
+                    const vy = (raw_tip.y - canvas.height/2)/canvasScale + canvas.height/2 - canvasOffset.y;
+
+                    if (!currentStroke) {
+                        currentStroke = { points: [{x:vx, y:vy}], color: settings.color, size: settings.size, tool: settings.tool };
+                        strokes.push(currentStroke);
+                    } else {
+                        const lastP = currentStroke.points[currentStroke.points.length-1];
+                        if (Math.hypot(vx-lastP.x, vy-lastP.y) > 2) {
+                            currentStroke.points.push({x:vx, y:vy});
+                        }
+                    }
+                } else {
+                    currentStroke = null;
+                }
+            }
+        }
+    }
+}
+
+const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+hands.onResults(onResults);
+
+const camera = new Camera(video, {
+    onFrame: async () => await hands.send({image: video}),
+    width: 1280, height: 720
+});
+camera.start();
+</script>
+</body>
+</html>
